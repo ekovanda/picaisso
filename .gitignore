@@ -1,0 +1,7 @@
+.env
+.venv
+gpt-image-generation-docs.md
+images/
+!images/.gitkeep
+game_state.json
+.github/
