@@ -10,19 +10,16 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Dict, Optional
 
-import requests
 import streamlit as st
-from dotenv import find_dotenv, load_dotenv
+from google.cloud import storage
+from google.oauth2 import service_account
 from openai import OpenAI
 from PIL import Image
-
-load_dotenv(find_dotenv(), override=False)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,62 +29,78 @@ logger = logging.getLogger(__name__)
 IMG_WIDTH = 400
 NUM_TRACKS = 4
 LOCK_TIMEOUT_MINUTES = 10
-IMAGES_DIR = "images"
-GAME_STATE_PATH = "game_state.json"
 OPENAI_MODEL = "gpt-image-2"
 OPENAI_IMAGE_QUALITY = "low"
 OPENAI_IMAGE_SIZE = "1024x1024"
 
-# Password protection
-PASSWORD_HASH = os.environ.get("PICAISSO_PASSWORD_HASH")
+# GCS blob name constants
+GCS_GAME_STATE_BLOB = "game_state.json"
+GCS_IMAGES_PREFIX = "images/"
+STARTING_IMAGE_BLOBS = [f"images/track_{i}_image_000.png" for i in range(NUM_TRACKS)]
 
-# Starting images for each track
-STARTING_IMAGE_PATHS = [os.path.join(IMAGES_DIR, f"track_{i}_image_000.png") for i in range(NUM_TRACKS)]
+# Password protection
+PASSWORD_HASH = st.secrets["PICAISSO_PASSWORD_HASH"]
 
 
 def get_openai_client() -> OpenAI:
     """Return a cached OpenAI client."""
     if "openai_client" not in st.session_state:
-        api_key = os.environ.get("OPENAI_KEY")
+        api_key = st.secrets["OPENAI_KEY"]
         if not api_key:
-            st.error("OPENAI_KEY not found in environment variables.")
+            st.error("OPENAI_KEY not found in secrets.")
             st.stop()
         st.session_state.openai_client = OpenAI(api_key=api_key)
     return st.session_state.openai_client
 
 
-# ── Local storage helpers ──────────────────────────────────────────────────────
+@st.cache_resource
+def get_gcs_bucket() -> storage.Bucket:
+    """Return a cached GCS bucket client built from st.secrets."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(creds_dict)
+    client = storage.Client(credentials=creds, project=creds_dict["project_id"])
+    return client.bucket(st.secrets["GCP_BUCKET_NAME"])
 
-def load_image_local(path: str) -> Optional[Image.Image]:
-    """Load a PIL Image from a local file path."""
+
+# ── GCS storage helpers ────────────────────────────────────────────────────────
+
+def load_image_gcs(blob_name: str) -> Optional[Image.Image]:
+    """Download a blob from GCS and return it as a PIL Image."""
     try:
-        if os.path.exists(path):
-            return Image.open(path).copy()
-        logger.warning("Image not found locally: %s", path)
-        return None
+        bucket = get_gcs_bucket()
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            logger.warning("Image blob not found in GCS: %s", blob_name)
+            return None
+        image_bytes = blob.download_as_bytes()
+        return Image.open(BytesIO(image_bytes)).copy()
     except Exception as e:
-        logger.error("Failed to load image %s: %s", path, e)
+        logger.error("Failed to load image from GCS %s: %s", blob_name, e)
         return None
 
 
-def save_image_local(image: Image.Image, path: str) -> bool:
-    """Save a PIL Image to a local file path, creating directories as needed."""
+def save_image_gcs(image: Image.Image, blob_name: str) -> bool:
+    """Upload a PIL Image as PNG to GCS."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        image.save(path, format="PNG")
-        logger.info("Image saved: %s", path)
+        bucket = get_gcs_bucket()
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        buf.seek(0)
+        bucket.blob(blob_name).upload_from_file(buf, content_type="image/png")
+        logger.info("Image saved to GCS: %s", blob_name)
         return True
     except Exception as e:
-        logger.error("Failed to save image %s: %s", path, e)
+        logger.error("Failed to save image to GCS %s: %s", blob_name, e)
         return False
 
 
 def load_game_state() -> Dict:
-    """Load game state from the local JSON file."""
+    """Load game state from GCS."""
     try:
-        if os.path.exists(GAME_STATE_PATH):
-            with open(GAME_STATE_PATH, "r", encoding="utf-8") as f:
-                state = json.load(f)
+        bucket = get_gcs_bucket()
+        blob = bucket.blob(GCS_GAME_STATE_BLOB)
+        if blob.exists():
+            state = json.loads(blob.download_as_text())
             if "tracks" not in state:
                 state = _init_game_state()
             if "locks" not in state:
@@ -97,18 +110,21 @@ def load_game_state() -> Dict:
                 }
             return state
     except Exception as e:
-        logger.error("Failed to load game state: %s", e)
+        logger.error("Failed to load game state from GCS: %s", e)
     return _init_game_state()
 
 
 def save_game_state(game_state: Dict) -> None:
-    """Save game state to the local JSON file."""
+    """Save game state to GCS."""
     try:
-        with open(GAME_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(game_state, f, indent=2)
-        logger.info("Game state saved.")
+        bucket = get_gcs_bucket()
+        bucket.blob(GCS_GAME_STATE_BLOB).upload_from_string(
+            json.dumps(game_state, indent=2),
+            content_type="application/json",
+        )
+        logger.info("Game state saved to GCS.")
     except Exception as e:
-        logger.error("Failed to save game state: %s", e)
+        logger.error("Failed to save game state to GCS: %s", e)
         st.error("Failed to save game state. Please try again.")
 
 
@@ -173,9 +189,9 @@ def get_next_image_number(game_state: Dict, track_id: int) -> int:
     return len(game_state["tracks"][str(track_id)]["history"])
 
 
-def get_current_image_path(game_state: Dict, track_id: int) -> str:
+def get_current_image_blob(game_state: Dict, track_id: int) -> str:
     image_num = len(game_state["tracks"][str(track_id)]["history"])
-    return os.path.join(IMAGES_DIR, f"track_{track_id}_image_{image_num:03d}.png")
+    return f"{GCS_IMAGES_PREFIX}track_{track_id}_image_{image_num:03d}.png"
 
 
 def check_and_release_expired_locks(game_state: Dict) -> Dict:
@@ -218,23 +234,23 @@ def can_user_access_track(game_state: Dict, track_id: int, session_id: str) -> b
 # ── View helpers ───────────────────────────────────────────────────────────────
 
 def display_current_image(game_state: Dict, track_id: int) -> None:
-    current_path = get_current_image_path(game_state, track_id)
-    image = load_image_local(current_path)
+    current_blob = get_current_image_blob(game_state, track_id)
+    image = load_image_gcs(current_blob)
 
     if image:
         st.image(image, width=IMG_WIDTH)
     else:
-        starting_image = load_image_local(STARTING_IMAGE_PATHS[track_id])
+        starting_image = load_image_gcs(STARTING_IMAGE_BLOBS[track_id])
         if starting_image:
             st.image(starting_image, width=IMG_WIDTH)
         else:
             st.warning(f"No image found for Track {track_id + 1}.")
-            st.info(f"Place a starting image at: `{STARTING_IMAGE_PATHS[track_id]}`")
+            st.info(f"Upload a starting image to GCS as: `{STARTING_IMAGE_BLOBS[track_id]}`")
 
 
 # ── Views ──────────────────────────────────────────────────────────────────────
 
-@st.dialog("� Enter Password")
+@st.dialog("🔐 Enter Password")
 def show_password_dialog() -> None:
     """Show password entry dialog."""
     st.markdown("Please enter the password to play:")
@@ -248,16 +264,20 @@ def show_password_dialog() -> None:
             st.error("❌ Incorrect password. Please try again.")
 
 
-@st.dialog("�👋 Welcome to Pic{AI}sso — Please Read First")
+@st.dialog("👋 Welcome to Pic{AI}sso 🎨 — Please Read First")
 def show_disclaimer_dialog() -> None:
-    st.warning(
-        "**This app uses Elliot Kovanda's personal OpenAI API Key** (AI Solutions & Data Insights). "
-        "Every image you generate has a real cost — please be mindful and avoid unnecessary generations."
+    st.info(
+        "**This app uses my personal OpenAI API Key**.\n\n"
+        "Every image you generate has a small but real cost — please be mindful and avoid unnecessary generations.\n\n"
+        "Thank you & have fun 💛\n\n"
+        "Elliot Kovanda"
+
     )
     st.error(
         "⚠️ **This is a public application.** Do NOT enter any internal company information, "
         "confidential data, client names, or sensitive content. "
-        "Keep all descriptions limited to public, shareable content only."
+        "Keep all descriptions limited to public, shareable content only. "
+        "Note, that other players will see the images you generate and the prompts you enter. Thus, enter only work-appropriate, non-confidential descriptions."
     )
     st.markdown("By clicking below you confirm you have read and understood the above.")
     if st.button("✅ I understand, let me play!", type="primary", use_container_width=True):
@@ -281,6 +301,8 @@ def render_onboarding_view() -> None:
 
     The goal is to practice **clear, precise prompting**. The more descriptive you are,
     the better the AI can recreate the image!
+                
+    The UI is in English for inclusivity but feel free to write your prompts in German if you prefer.
     """)
     st.markdown("---")
     name_input = st.text_input(
@@ -312,12 +334,12 @@ def render_track_selection_view(game_state: Dict) -> None:
         with st.container():
             col_img, col_info = st.columns([1, 2])
             with col_img:
-                current_path = get_current_image_path(game_state, track_id)
-                image = load_image_local(current_path)
+                current_blob = get_current_image_blob(game_state, track_id)
+                image = load_image_gcs(current_blob)
                 if image:
                     st.image(image, width=IMG_WIDTH)
                 else:
-                    starting_image = load_image_local(STARTING_IMAGE_PATHS[track_id])
+                    starting_image = load_image_gcs(STARTING_IMAGE_BLOBS[track_id])
                     if starting_image:
                         st.image(starting_image, width=IMG_WIDTH)
                     else:
@@ -419,9 +441,9 @@ def render_playing_view(game_state: Dict) -> None:
                         if generated_image is not None:
                             next_image_num = get_next_image_number(game_state, track_id)
                             next_image_filename = f"track_{track_id}_image_{next_image_num + 1:03d}.png"
-                            next_image_path = os.path.join(IMAGES_DIR, next_image_filename)
+                            next_image_blob = f"{GCS_IMAGES_PREFIX}{next_image_filename}"
 
-                            if save_image_local(generated_image, next_image_path):
+                            if save_image_gcs(generated_image, next_image_blob):
                                 game_state["tracks"][str(track_id)]["history"].append(
                                     {
                                         "image_filename": next_image_filename,
@@ -433,7 +455,7 @@ def render_playing_view(game_state: Dict) -> None:
                                 game_state = release_track(game_state, track_id)
                                 save_game_state(game_state)
                                 st.session_state.generated_image_data = {
-                                    "image_path": next_image_path,
+                                    "image_blob": next_image_blob,
                                     "prompt": description.strip(),
                                     "track_id": track_id,
                                 }
@@ -442,7 +464,7 @@ def render_playing_view(game_state: Dict) -> None:
                                 st.session_state.current_view = "success"
                                 st.rerun()
                             else:
-                                st.error("❌ Failed to save image. Please try again.")
+                                st.error("❌ Failed to save image to GCS. Please try again.")
                                 st.session_state.generating = False
                         else:
                             st.error("❌ Failed to generate image. Please try again.")
@@ -471,7 +493,7 @@ def render_success_view(game_state: Dict) -> None:
     st.success(f"**{st.session_state.user_name}**, your image has been generated!")
     st.markdown("---")
     st.markdown("### Your Generated Image")
-    generated_image = load_image_local(data["image_path"])
+    generated_image = load_image_gcs(data["image_blob"])
     if generated_image:
         st.image(generated_image, width=IMG_WIDTH)
     with st.expander("📝 Your Prompt"):
@@ -524,8 +546,8 @@ def render_gallery_view(game_state: Dict) -> None:
     for idx, entry in enumerate(reversed(track_history), 1):
         actual_image_num = len(track_history) - idx + 1
         st.markdown(f"### Image {actual_image_num}")
-        image_path = os.path.join(IMAGES_DIR, entry["image_filename"])
-        image = load_image_local(image_path)
+        image_blob = f"{GCS_IMAGES_PREFIX}{entry['image_filename']}"
+        image = load_image_gcs(image_blob)
         if image:
             st.image(image, width=IMG_WIDTH)
         st.caption(f"👤 **{entry['user_name']}** • 🕒 {entry['timestamp'][:19].replace('T', ' ')}")
@@ -533,7 +555,7 @@ def render_gallery_view(game_state: Dict) -> None:
             st.write(entry["prompt_text"])
         st.markdown("---")
 
-    starting_image = load_image_local(STARTING_IMAGE_PATHS[selected_track_id])
+    starting_image = load_image_gcs(STARTING_IMAGE_BLOBS[selected_track_id])
     if starting_image:
         st.markdown("### 🎬 Starting Image")
         st.image(starting_image, width=IMG_WIDTH)
@@ -542,17 +564,19 @@ def render_gallery_view(game_state: Dict) -> None:
 
 
 def _bootstrap_starting_images() -> None:
-    """Copy pumpkin.png to any missing track starting images."""
-    source = os.path.join(IMAGES_DIR, "pumpkin.png")
-    if not os.path.exists(source):
+    """Copy pumpkin.png blob to any missing track starting image blobs in GCS."""
+    bucket = get_gcs_bucket()
+    source_blob = bucket.blob(f"{GCS_IMAGES_PREFIX}pumpkin.png")
+    if not source_blob.exists():
+        logger.warning("Bootstrap source not found in GCS: %simages/pumpkin.png", GCS_IMAGES_PREFIX)
         return
-    for path in STARTING_IMAGE_PATHS:
-        if not os.path.exists(path):
+    for blob_name in STARTING_IMAGE_BLOBS:
+        if not bucket.blob(blob_name).exists():
             try:
-                shutil.copy2(source, path)
-                logger.info("Bootstrapped starting image: %s", path)
+                bucket.copy_blob(source_blob, bucket, blob_name)
+                logger.info("Bootstrapped starting image in GCS: %s", blob_name)
             except Exception as e:
-                logger.warning("Could not copy starting image to %s: %s", path, e)
+                logger.warning("Could not copy starting image to GCS %s: %s", blob_name, e)
 
 
 def main():
@@ -575,12 +599,13 @@ def main():
     game_state = check_and_release_expired_locks(game_state)
     save_game_state(game_state)
 
-    missing_tracks = [i for i in range(NUM_TRACKS) if not os.path.exists(STARTING_IMAGE_PATHS[i])]
+    bucket = get_gcs_bucket()
+    missing_tracks = [i for i in range(NUM_TRACKS) if not bucket.blob(STARTING_IMAGE_BLOBS[i]).exists()]
     if len(missing_tracks) == NUM_TRACKS:
-        st.error("⚠️ No starting images found!")
-        st.info("Place at least one starting image in the `images/` directory:")
-        for path in STARTING_IMAGE_PATHS:
-            st.code(path)
+        st.error("⚠️ No starting images found in GCS!")
+        st.info("Upload starting images to the GCS bucket as:")
+        for blob_name in STARTING_IMAGE_BLOBS:
+            st.code(blob_name)
         st.stop()
 
     if st.session_state.current_view == "onboarding":
