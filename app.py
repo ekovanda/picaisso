@@ -35,8 +35,8 @@ def t(key: str) -> str:
 
 # Constants
 IMG_WIDTH = 400
-NUM_TRACKS = 4
-LOCK_TIMEOUT_MINUTES = 10
+NUM_TRACKS = 8
+LOCK_TIMEOUT_MINUTES = 5
 OPENAI_MODEL = "gpt-image-2"
 OPENAI_IMAGE_QUALITY = "low"
 OPENAI_IMAGE_SIZE = "1024x1024"
@@ -104,19 +104,28 @@ def save_image_gcs(image: Image.Image, blob_name: str) -> bool:
 
 
 def load_game_state() -> Dict:
-    """Load game state from GCS."""
+    """Load game state from GCS, backfilling any missing tracks/locks for the current NUM_TRACKS."""
     try:
         bucket = get_gcs_bucket()
         blob = bucket.blob(GCS_GAME_STATE_BLOB)
         if blob.exists():
             state = json.loads(blob.download_as_text())
             if "tracks" not in state:
-                state = _init_game_state()
+                state["tracks"] = {}
             if "locks" not in state:
-                state["locks"] = {
-                    str(i): {"locked": False, "session_id": None, "timestamp": None}
-                    for i in range(NUM_TRACKS)
-                }
+                state["locks"] = {}
+            # Backfill any track/lock entries that don't exist yet
+            dirty = False
+            for i in range(NUM_TRACKS):
+                key = str(i)
+                if key not in state["tracks"]:
+                    state["tracks"][key] = {"history": []}
+                    dirty = True
+                if key not in state["locks"]:
+                    state["locks"][key] = {"locked": False, "session_id": None, "timestamp": None}
+                    dirty = True
+            if dirty:
+                save_game_state(state)
             return state
     except Exception as e:
         logger.error("Failed to load game state from GCS: %s", e)
