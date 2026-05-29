@@ -35,7 +35,7 @@ def t(key: str) -> str:
 
 # Constants
 IMG_WIDTH = 400
-NUM_TRACKS = 8
+NUM_TRACKS = 10
 LOCK_TIMEOUT_MINUTES = 5
 OPENAI_MODEL = "gpt-image-2"
 OPENAI_IMAGE_QUALITY = "low"
